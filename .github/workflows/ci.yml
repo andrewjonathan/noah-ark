@@ -1,8 +1,11 @@
 name: CI
+# PAUSED (GitHub Actions billing): runs only when started by hand from the Actions tab.
+# To re-enable automatic runs, replace `workflow_dispatch:` with:
+#   push:
+#     branches: [main]
+#   pull_request:
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:

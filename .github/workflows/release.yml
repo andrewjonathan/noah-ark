@@ -2,9 +2,13 @@
 # One-time setup: on pypi.org add a "Trusted Publisher" for this repo
 # (workflow: release.yml, environment: pypi). No API token needed.
 name: Release
+# PAUSED (GitHub Actions billing): pushing a tag no longer publishes.
+# It can still be started by hand from the Actions tab (pick the tag as the ref).
+# To re-enable publish-on-tag, replace `workflow_dispatch:` with:
+#   push:
+#     tags: ["v*"]
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   build:

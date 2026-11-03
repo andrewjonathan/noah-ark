@@ -9,15 +9,19 @@ description = "Run all your services from one YAML file with one command: labell
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [{ name = "YOUR NAME", email = "you@example.com" }]
+authors = [{ name = "Andrew Jonathan" }]
 keywords = ["process-manager", "pm2", "supervisor", "fastapi", "devtools", "microservices"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: System :: Systems Administration",
   "Topic :: Software Development :: Build Tools",
 ]
@@ -31,8 +35,9 @@ noah = "noah_ark.cli:main"
 noah-ark = "noah_ark.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/noah-ark"
-Issues = "https://github.com/YOUR_USERNAME/noah-ark/issues"
+Homepage = "https://github.com/andrewjonathan/noah-ark"
+Issues = "https://github.com/andrewjonathan/noah-ark/issues"
+Changelog = "https://github.com/andrewjonathan/noah-ark/releases"
 
 [tool.hatch.version]
 path = "src/noah_ark/__init__.py"

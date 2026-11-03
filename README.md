@@ -1,5 +1,9 @@
 # ⛵ noah-ark
 
+[![PyPI](https://img.shields.io/pypi/v/noah-ark)](https://pypi.org/project/noah-ark/)
+[![Python](https://img.shields.io/pypi/pyversions/noah-ark)](https://pypi.org/project/noah-ark/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Run every service in your project from one YAML file, with one command.**
 Live, labelled, colour-coded logs. Dependency-aware startup. Automatic restarts.
 Clean shutdown of every process tree. No daemon, no containers, no Node runtime.
@@ -38,15 +42,34 @@ less to learn.
 
 ## Install
 
+noah-ark is published on [PyPI](https://pypi.org/project/noah-ark/). The recommended
+way to install a CLI tool is [pipx](https://pipx.pypa.io/), which keeps it in its own
+environment and puts `noah` on your `PATH`:
+
 ```bash
-pip install noah-ark        # once published
-# or, from source:
-git clone https://github.com/YOUR_USERNAME/noah-ark && cd noah-ark
-pip install -e .
+pipx install noah-ark
+# or with uv
+uv tool install noah-ark
+# or with plain pip (inside a virtualenv or with --user)
+pip install noah-ark
 ```
+
+Check it works:
+
+```bash
+noah --version
+```
+
+Upgrade later with `pipx upgrade noah-ark` (or `pip install -U noah-ark`).
 
 Two commands are installed: `noah` and the alias `noah-ark`. Linux and macOS are
 supported; on Windows use WSL.
+
+To install the latest unreleased code instead:
+
+```bash
+pipx install git+https://github.com/andrewjonathan/noah-ark
+```
 
 ## Quick start
 
@@ -64,10 +87,11 @@ noah init        # scans ./services/* and writes ark.yaml
 noah up          # start everything, stream logs, Ctrl+C stops it all
 ```
 
-Try the bundled demo:
+Try the bundled demo (it lives in the repository, not in the PyPI package):
 
 ```bash
-cd examples/demo
+git clone https://github.com/andrewjonathan/noah-ark
+cd noah-ark/examples/demo
 pip install -r requirements.txt
 noah up
 curl localhost:8002/orders/42      # api-b calls api-a; watch both logs
@@ -176,6 +200,7 @@ src/noah_ark/
 ## Development
 
 ```bash
+git clone https://github.com/andrewjonathan/noah-ark && cd noah-ark
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 ruff check . && pytest -q
@@ -190,23 +215,50 @@ ruff check . && pytest -q
 - [ ] Log filtering: `noah logs --grep ERROR`
 - [ ] `noah up --profile dev` (service groups)
 - [ ] Windows support (Job Objects instead of process groups)
-- [ ] Distribution: PyPI ✅ (release workflow), then `.deb` packages on GitHub Releases
-      built with nfpm, then a Launchpad PPA for `apt install noah-ark`
+- [x] Distribution: PyPI (`pipx install noah-ark`)
+- [ ] Distribution: `.deb` packages on GitHub Releases built with nfpm, then a
+      Launchpad PPA for `apt install noah-ark`
 
-## Publishing
+## Releasing (maintainers)
 
-**PyPI:** check that the name `noah-ark` is free on pypi.org, add a Trusted Publisher
-for this repo (workflow `release.yml`, environment `pypi`), then:
+> **GitHub Actions is currently paused.** `ci.yml` and `release.yml` only run when
+> started by hand from the Actions tab; pushes, pull requests and tags do not trigger
+> them. Release from your machine as described below. To turn automation back on, restore
+> the `on:` triggers noted at the top of each workflow file.
 
-```bash
-git tag v0.1.0 && git push --tags
-```
+To publish a new version manually:
 
-Users then install with `pip install noah-ark` or, better for CLI tools, `pipx install noah-ark`.
+1. Bump `__version__` in [`src/noah_ark/__init__.py`](src/noah_ark/__init__.py)
+   (PyPI never accepts the same version twice).
+2. Run the checks locally, since CI is not running:
 
-**apt:** Debian packaging comes after PyPI. The simplest route is building a `.deb`
-in CI (for example with nfpm, depending on `python3` and `python3-yaml`) and attaching it
-to GitHub Releases; a Launchpad PPA enables `sudo apt install noah-ark`.
+   ```bash
+   pip install -e ".[dev]" twine
+   ruff check . && pytest -q
+   ```
+
+3. Build and check the package:
+
+   ```bash
+   rm -rf dist && python -m build && twine check dist/*
+   ```
+
+4. Upload with a PyPI API token (create one at <https://pypi.org/manage/account/token/>,
+   scoped to the `noah-ark` project):
+
+   ```bash
+   TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... twine upload dist/*
+   ```
+
+5. Commit, tag and push so the repository matches what is on PyPI:
+
+   ```bash
+   git commit -am "Release v0.2.0"
+   git tag v0.2.0
+   git push && git push --tags
+   ```
+
+Users then get it with `pipx upgrade noah-ark`.
 
 ## License
 
