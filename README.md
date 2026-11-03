@@ -226,39 +226,23 @@ ruff check . && pytest -q
 > them. Release from your machine as described below. To turn automation back on, restore
 > the `on:` triggers noted at the top of each workflow file.
 
-To publish a new version manually:
+Release with [`scripts/release.sh`](scripts/release.sh). It bumps the version, runs
+`ruff` and `pytest`, builds and checks the package with `twine`, uploads it to PyPI,
+then commits, tags and pushes. It stops at the first failure and asks before the upload
+and the push.
 
-1. Bump `__version__` in [`src/noah_ark/__init__.py`](src/noah_ark/__init__.py)
-   (PyPI never accepts the same version twice).
-2. Run the checks locally, since CI is not running:
+```bash
+pip install -e ".[dev]" twine            # one-time: tools the script needs
+export PYPI_TOKEN=pypi-...               # token scoped to the noah-ark project
+                                         # (https://pypi.org/manage/account/token/)
 
-   ```bash
-   pip install -e ".[dev]" twine
-   ruff check . && pytest -q
-   ```
+scripts/release.sh patch --dry-run       # check everything, upload nothing
+scripts/release.sh patch                 # 0.1.0 -> 0.1.1 (also: minor, major, or 0.2.0)
+```
 
-3. Build and check the package:
-
-   ```bash
-   rm -rf dist && python -m build && twine check dist/*
-   ```
-
-4. Upload with a PyPI API token (create one at <https://pypi.org/manage/account/token/>,
-   scoped to the `noah-ark` project):
-
-   ```bash
-   TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... twine upload dist/*
-   ```
-
-5. Commit, tag and push so the repository matches what is on PyPI:
-
-   ```bash
-   git commit -am "Release v0.2.0"
-   git tag v0.2.0
-   git push && git push --tags
-   ```
-
-Users then get it with `pipx upgrade noah-ark`.
+Run it from a clean `main` branch. Without `PYPI_TOKEN`, it falls back to `~/.pypirc`.
+Add `--yes` to skip the confirmation prompts. Users then get the new version with
+`pipx upgrade noah-ark`.
 
 ## License
 
