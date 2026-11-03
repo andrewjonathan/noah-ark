@@ -181,18 +181,6 @@ pip install -e ".[dev]"
 ruff check . && pytest -q
 ```
 
-## Roadmap
-
-- [ ] `noah restart <svc>` and `noah stop <svc>` via a control socket (`.ark/noah.sock`)
-- [ ] File watching (`watch: ["**/*.py"]`) for any service, not only uvicorn `--reload`
-- [ ] HTTP readiness checks (`ready: {http: /health}`)
-- [ ] Per-service CPU / memory in `noah ps`
-- [ ] Log filtering: `noah logs --grep ERROR`
-- [ ] `noah up --profile dev` (service groups)
-- [ ] Windows support (Job Objects instead of process groups)
-- [ ] Distribution: PyPI ✅ (release workflow), then `.deb` packages on GitHub Releases
-      built with nfpm, then a Launchpad PPA for `apt install noah-ark`
-
 ## Publishing
 
 **PyPI:** check that the name `noah-ark` is free on pypi.org, add a Trusted Publisher
