@@ -1,0 +1,28 @@
+# Demo: two FastAPI services and a plain Python worker.
+#   pip install -r requirements.txt
+#   noah up
+version: 1
+name: demo
+
+env:
+  LOG_LEVEL: info
+
+services:
+  api-a:
+    cwd: services/api_a
+    cmd: uvicorn main:app --host 127.0.0.1 --port 8001
+    ready: 8001            # api-b waits until this port is open
+
+  api-b:
+    cwd: services/api_b
+    cmd: uvicorn main:app --host 127.0.0.1 --port 8002
+    env:
+      API_A_URL: http://127.0.0.1:8001
+    depends_on: [api-a]
+    ready: 8002
+
+  worker:
+    cwd: services/worker
+    cmd: python3 worker.py
+    restart: always
+    depends_on: [api-a]
