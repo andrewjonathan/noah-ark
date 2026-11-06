@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any
 
-from noah_ark.config import Service
+from noah_ark.config import ReadyCheck, Service
 from noah_ark.logs import LogSink
 
 READ_LIMIT = 1024 * 1024  # longest single log line we keep (bytes)
@@ -144,23 +144,52 @@ class ManagedProcess:
             return
         loop = asyncio.get_running_loop()
         deadline = loop.time() + check.timeout
+        last = f"port {check.port} not open"
         while loop.time() < deadline:
-            try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(check.host, check.port), timeout=1.0
-                )
-                writer.close()
+            ok, detail = await self._probe(check)
+            if ok:
                 self._set(Status.RUNNING)
-                self.sink.event(self.name, f"ready on {check.host}:{check.port}")
+                self.sink.event(self.name, f"ready {detail}")
                 self.ready.set()
                 return
-            except (OSError, asyncio.TimeoutError):
-                await asyncio.sleep(0.25)
+            last = detail or last
+            await asyncio.sleep(0.25)
         self._set(Status.RUNNING)
         self.sink.event(
-            self.name, f"port {check.port} not open after {check.timeout:g}s, continuing anyway"
+            self.name, f"not ready after {check.timeout:g}s ({last}), continuing anyway"
         )
         self.ready.set()
+
+    @staticmethod
+    async def _probe(check: ReadyCheck) -> tuple[bool, str]:
+        """One readiness attempt. Returns (ok, detail for the log)."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(check.host, check.port), timeout=1.0
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False, ""
+        try:
+            if check.http is None:
+                return True, f"on {check.host}:{check.port}"
+            request = (
+                f"GET {check.http} HTTP/1.0\r\nHost: {check.host}:{check.port}\r\n"
+                "User-Agent: noah-ark\r\nConnection: close\r\n\r\n"
+            )
+            writer.write(request.encode("latin-1"))
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            parts = line.decode("latin-1").split()
+            if len(parts) < 2 or not parts[0].startswith("HTTP/") or not parts[1].isdigit():
+                return False, f"GET {check.http}: not an HTTP response"
+            code = int(parts[1])
+            return check.accepts(code), f"(GET {check.http} → {code})"
+        except (OSError, asyncio.TimeoutError) as exc:
+            return False, f"GET {check.http}: {exc.__class__.__name__}"
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     # ------------------------------------------------------------- lifecycle
     async def _wait_or_stop(self, aw: Awaitable[Any]) -> bool:

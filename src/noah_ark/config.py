@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -29,11 +30,20 @@ class ConfigError(Exception):
 
 @dataclass
 class ReadyCheck:
-    """A service is 'ready' once this TCP port accepts connections."""
+    """A service is 'ready' once this TCP port accepts connections.
+
+    With `http` set, it must also answer `GET <http>` with `status`
+    (or any 2xx/3xx when `status` is not set).
+    """
 
     port: int
     host: str = "127.0.0.1"
     timeout: float = 30.0
+    http: str | None = None
+    status: int | None = None
+
+    def accepts(self, code: int) -> bool:
+        return code == self.status if self.status is not None else 200 <= code < 400
 
 
 @dataclass
@@ -219,19 +229,53 @@ def _number(raw: dict[str, Any], key: str, default: float, kind: type, where: st
     return kind(value)
 
 
+READY_HELP = "a port number, an http://host:port/path URL, or {port, host, http, status, timeout}"
+
+
 def _parse_ready(raw: Any, where: str) -> ReadyCheck | None:
     if raw is None:
         return None
     if isinstance(raw, int) and not isinstance(raw, bool):
         raw = {"port": raw}
+    elif isinstance(raw, str):
+        raw = _parse_ready_url(raw, where)
     if not isinstance(raw, dict):
-        raise ConfigError(f"{where}: `ready` must be a port number or {{port, host, timeout}}")
-    _check_keys(raw, {"port", "host", "timeout"}, f"{where}: ready")
+        raise ConfigError(f"{where}: `ready` must be {READY_HELP}")
+    _check_keys(raw, {"port", "host", "timeout", "http", "status"}, f"{where}: ready")
     port = raw.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ConfigError(f"{where}: ready.port must be a number between 1 and 65535")
     timeout = _number(raw, "timeout", 30.0, float, f"{where}: ready")
-    return ReadyCheck(port=port, host=str(raw.get("host", "127.0.0.1")), timeout=timeout)
+    http = raw.get("http")
+    if http is not None and (not isinstance(http, str) or not http.startswith("/")):
+        raise ConfigError(f"{where}: ready.http must be a path starting with '/', e.g. /health")
+    status = raw.get("status")
+    if status is not None:
+        if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+            raise ConfigError(f"{where}: ready.status must be an HTTP status code (100-599)")
+        if http is None:
+            raise ConfigError(f"{where}: ready.status needs ready.http")
+    return ReadyCheck(
+        port=port,
+        host=str(raw.get("host", "127.0.0.1")),
+        timeout=timeout,
+        http=http,
+        status=status,
+    )
+
+
+def _parse_ready_url(raw: str, where: str) -> dict[str, Any]:
+    url = urlsplit(raw.strip())
+    try:
+        port = url.port
+    except ValueError:
+        port = None
+    if url.scheme != "http" or not url.hostname or port is None:
+        raise ConfigError(
+            f"{where}: ready URL must look like http://127.0.0.1:8001/health (got {raw!r})"
+        )
+    path = (url.path or "/") + (f"?{url.query}" if url.query else "")
+    return {"port": port, "host": url.hostname, "http": path}
 
 
 def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) -> Service:

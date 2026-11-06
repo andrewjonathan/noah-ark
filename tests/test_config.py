@@ -66,9 +66,36 @@ def test_env_expansion(tmp_path, monkeypatch):
     ("a: {cmd: x, ready: 99999}", "between 1 and 65535"),
     ("ark: {cmd: x}", "reserved"),
     ("a: {cmd: x, cwd: nope}", "cwd does not exist"),
+    ("a: {cmd: x, ready: {port: 80, http: health}}", "starting with '/'"),
+    ("a: {cmd: x, ready: {port: 80, status: 200}}", "needs ready.http"),
+    ("a: {cmd: x, ready: {port: 80, http: /h, status: 42}}", "HTTP status code"),
+    ("a: {cmd: x, ready: 'https://localhost:80/h'}", "ready URL must look like"),
+    ("a: {cmd: x, ready: 'http://localhost/h'}", "ready URL must look like"),
 ])
 def test_rejects_invalid_config(tmp_path, body, message):
     path = tmp_path / "ark.yaml"
     path.write_text("services:\n  " + body + "\n")
     with pytest.raises(ConfigError, match=message):
         load_project(path)
+
+
+def test_http_ready_check(tmp_path):
+    path = write(tmp_path, """
+        services:
+          a:
+            cmd: sleep 1
+            ready: {port: 8001, http: /health, status: 204, timeout: 5}
+          b:
+            cmd: sleep 1
+            ready: http://localhost:8002/ready?deep=1
+          c:
+            cmd: sleep 1
+            ready: 8003
+    """)
+    services = load_project(path).services
+    a, b, c = services["a"].ready, services["b"].ready, services["c"].ready
+    assert (a.port, a.http, a.status, a.timeout) == (8001, "/health", 204, 5.0)
+    assert a.accepts(204) and not a.accepts(200)
+    assert (b.host, b.port, b.http, b.status) == ("localhost", 8002, "/ready?deep=1", None)
+    assert b.accepts(200) and b.accepts(302) and not b.accepts(503)
+    assert c.http is None
