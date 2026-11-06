@@ -21,12 +21,13 @@ class Supervisor:
         project: Project,
         names: Iterable[str] | None = None,
         *,
+        profiles: Iterable[str] = (),
         console: bool = True,
         color: bool | None = None,
         timestamps: bool = False,
     ):
         self.project = project
-        self.levels = project.levels(project.select(names))
+        self.levels = project.levels(project.select(names, profiles))
         self.names = [n for level in self.levels for n in level]
         self.console = console
         self.color = color

@@ -20,7 +20,7 @@ RESTART_POLICIES = ("no", "on-failure", "always")
 TOP_LEVEL_KEYS = {"version", "name", "env", "services"}
 SERVICE_KEYS = {
     "cmd", "cwd", "env", "env_file", "venv", "shell",
-    "restart", "max_restarts", "stop_timeout", "depends_on", "ready",
+    "restart", "max_restarts", "stop_timeout", "depends_on", "ready", "profiles",
 }
 
 
@@ -57,6 +57,7 @@ class Service:
     stop_timeout: float = 10.0
     depends_on: list[str] = field(default_factory=list)
     ready: ReadyCheck | None = None
+    profiles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -74,11 +75,25 @@ class Project:
     def log_dir(self) -> Path:
         return self.state_dir / "logs"
 
-    def select(self, names: Iterable[str] | None = None) -> list[str]:
-        """The requested services plus everything they (transitively) depend on."""
+    def select(
+        self, names: Iterable[str] | None = None, profiles: Iterable[str] = ()
+    ) -> list[str]:
+        """The requested services plus everything they (transitively) depend on.
+
+        With no names: every service without `profiles`, plus those in an active profile.
+        Explicitly named services are always selected, whatever their profiles.
+        """
         wanted = list(names or [])
+        active = set(profiles)
+        unknown_profiles = sorted(active - {p for s in self.services.values() for p in s.profiles})
+        if unknown_profiles:
+            raise ConfigError(f"unknown profile(s): {', '.join(unknown_profiles)}")
         if not wanted:
-            return list(self.services)
+            wanted = [
+                n for n, s in self.services.items() if not s.profiles or active & set(s.profiles)
+            ]
+            if not wanted:
+                raise ConfigError("no services selected (every service is in a profile)")
         unknown = [n for n in wanted if n not in self.services]
         if unknown:
             raise ConfigError(
@@ -327,6 +342,12 @@ def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) 
     if not isinstance(depends_on, list):
         raise ConfigError(f"{where}: depends_on must be a list of service names")
 
+    profiles = raw.get("profiles") or []
+    if isinstance(profiles, str):
+        profiles = [profiles]
+    if not isinstance(profiles, list) or not all(NAME_RE.match(str(x)) for x in profiles):
+        raise ConfigError(f"{where}: profiles must be a list of names")
+
     return Service(
         name=name,
         cmd=cmd,
@@ -337,4 +358,5 @@ def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) 
         stop_timeout=_number(raw, "stop_timeout", 10.0, float, where),
         depends_on=[str(d) for d in depends_on],
         ready=_parse_ready(raw.get("ready"), where),
+        profiles=[str(x) for x in profiles],
     )

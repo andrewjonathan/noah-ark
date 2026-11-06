@@ -99,3 +99,20 @@ def test_http_ready_check(tmp_path):
     assert (b.host, b.port, b.http, b.status) == ("localhost", 8002, "/ready?deep=1", None)
     assert b.accepts(200) and b.accepts(302) and not b.accepts(503)
     assert c.http is None
+
+
+def test_profiles_selection(tmp_path):
+    path = write(tmp_path, """
+        services:
+          db: sleep 1
+          api: {cmd: sleep 1, depends_on: [db]}
+          jobs: {cmd: sleep 1, profiles: [workers], depends_on: [db]}
+          admin: {cmd: sleep 1, profiles: [tools, workers]}
+    """)
+    project = load_project(path)
+    assert project.select() == ["db", "api"]
+    assert project.select(profiles=["workers"]) == ["db", "api", "jobs", "admin"]
+    assert project.select(profiles=["tools"]) == ["db", "api", "admin"]
+    assert project.select(["jobs"]) == ["db", "jobs"]  # named: profiles don't matter
+    with pytest.raises(ConfigError, match="unknown profile"):
+        project.select(profiles=["nope"])
