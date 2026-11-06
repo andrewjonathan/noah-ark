@@ -8,7 +8,7 @@ import signal
 import time
 from collections.abc import Iterable
 
-from noah_ark import __version__
+from noah_ark import __version__, watch
 from noah_ark.config import Project
 from noah_ark.control import ControlServer, socket_path
 from noah_ark.logs import ARK, LogSink
@@ -40,6 +40,8 @@ class Supervisor:
         self.store = StateStore(project.state_dir)
         self.procs: dict[str, ManagedProcess] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.watchers: list[asyncio.Task[None]] = []
+        self._held: set[str] = set()  # stopped on request: file changes don't revive them
         self._started_at = time.time()
         self._forced = False
         self.control: ControlServer | None = None
@@ -80,14 +82,23 @@ class Supervisor:
         try:
             for name in self.names:
                 self._launch(name)
+            self.watchers = [
+                asyncio.create_task(self._watch(n))
+                for n in self.names
+                if self.project.services[n].watch
+            ]
             shutdown = asyncio.create_task(self._shutdown.wait())
             idle = asyncio.create_task(self._idle.wait())
-            await asyncio.wait({idle, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+            # With watchers, keep running after every service exits: a change restarts them.
+            waits = {shutdown} if self.watchers else {idle, shutdown}
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            for task in self.watchers:
+                task.cancel()
             if self._shutdown.is_set():
                 await self._stop_all()
             else:
                 self.sink.event(ARK, "all services have exited")
-            await asyncio.gather(*self.tasks.values())
+            await asyncio.gather(*self.tasks.values(), *self.watchers, return_exceptions=True)
             shutdown.cancel()
             idle.cancel()
         finally:
@@ -139,16 +150,19 @@ class Supervisor:
         task = self.tasks.get(name)
         return task is not None and not task.done()
 
-    async def start(self, name: str) -> str:
+    async def start(self, name: str, reason: str = "requested") -> str:
         proc = self._proc(name)
+        self._held.discard(name)
         if self._running(name):
             return f"{name}: already {proc.status.value}"
+        self.sink.event(name, f"starting ({reason})")
         proc.reset()
         self._launch(name, wait_for_deps=False)
         return f"{name}: started"
 
     async def stop(self, name: str) -> str:
         proc = self._proc(name)
+        self._held.add(name)
         if not self._running(name):
             return f"{name}: not running ({proc.status.value})"
         await proc.stop()
@@ -158,11 +172,43 @@ class Supervisor:
     async def restart(self, name: str, reason: str = "requested") -> str:
         proc = self._proc(name)
         if not self._running(name):
-            return await self.start(name)
+            return await self.start(name, reason)
         if proc.status is Status.WAITING:
             return f"{name}: still waiting for its dependencies, not restarted"
         await proc.restart(reason)
         return f"{name}: restarted"
+
+    async def _watch(self, name: str) -> None:
+        """Poll the service's files; restart it (or start it again) when they change."""
+        svc = self.project.services[name]
+        spec = svc.watch
+        assert spec is not None
+        ignore = [*watch.DEFAULT_IGNORE, *spec.ignore]
+
+        def scan() -> dict[str, int]:
+            return watch.snapshot(svc.cwd, spec.paths, ignore)
+
+        try:
+            # A thread keeps a slow scan of a big tree from stalling the log pumps.
+            before = await asyncio.to_thread(scan)
+            self.sink.event(name, f"watching {len(before)} file(s) for changes")
+            while True:
+                await asyncio.sleep(spec.interval)
+                now = await asyncio.to_thread(scan)
+                if not watch.diff(before, now):
+                    continue
+                await asyncio.sleep(spec.debounce)  # let a save (or a git checkout) settle
+                now = await asyncio.to_thread(scan)
+                changed = watch.diff(before, now)
+                before = now
+                if changed and name not in self._held:
+                    await self.restart(name, watch.describe(changed))
+        except ControlError:  # shutting down
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.sink.event(name, f"file watching stopped: {exc!r}")
 
     async def _stop_all(self) -> None:
         self.sink.event(ARK, "shutting down (press Ctrl+C again to force)")

@@ -20,8 +20,9 @@ RESTART_POLICIES = ("no", "on-failure", "always")
 TOP_LEVEL_KEYS = {"version", "name", "env", "services"}
 SERVICE_KEYS = {
     "cmd", "cwd", "env", "env_file", "venv", "shell",
-    "restart", "max_restarts", "stop_timeout", "depends_on", "ready", "profiles",
+    "restart", "max_restarts", "stop_timeout", "depends_on", "ready", "profiles", "watch",
 }
+WATCH_KEYS = {"paths", "ignore", "interval", "debounce"}
 
 
 class ConfigError(Exception):
@@ -47,6 +48,16 @@ class ReadyCheck:
 
 
 @dataclass
+class WatchSpec:
+    """Restart the service when files matching `paths` (under its cwd) change."""
+
+    paths: list[str]
+    ignore: list[str] = field(default_factory=list)  # added to watch.DEFAULT_IGNORE
+    interval: float = 1.0
+    debounce: float = 0.3
+
+
+@dataclass
 class Service:
     name: str
     cmd: list[str]
@@ -58,6 +69,7 @@ class Service:
     depends_on: list[str] = field(default_factory=list)
     ready: ReadyCheck | None = None
     profiles: list[str] = field(default_factory=list)
+    watch: WatchSpec | None = None
 
 
 @dataclass
@@ -293,6 +305,38 @@ def _parse_ready_url(raw: str, where: str) -> dict[str, Any]:
     return {"port": port, "host": url.hostname, "http": path}
 
 
+def _string_list(raw: Any, what: str) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x.strip() for x in raw):
+        raise ConfigError(f"{what} must be a pattern or a list of patterns")
+    return list(raw)
+
+
+def _parse_watch(raw: Any, where: str) -> WatchSpec | None:
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, (str, list)):
+        raw = {"paths": raw}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: `watch` must be a pattern, a list, or {{paths, ignore, ...}}")
+    _check_keys(raw, WATCH_KEYS, f"{where}: watch")
+    paths = _string_list(raw.get("paths"), f"{where}: watch.paths")
+    if not paths:
+        raise ConfigError(f"{where}: watch.paths must not be empty")
+    for pattern in paths:
+        if pattern.startswith("/") or ".." in pattern.split("/"):
+            raise ConfigError(
+                f"{where}: watch pattern {pattern!r} must stay inside the service's cwd"
+            )
+    ignore = _string_list(raw["ignore"], f"{where}: watch.ignore") if "ignore" in raw else []
+    interval = _number(raw, "interval", 1.0, float, f"{where}: watch")
+    if interval < 0.1:
+        raise ConfigError(f"{where}: watch.interval must be at least 0.1 seconds")
+    debounce = _number(raw, "debounce", 0.3, float, f"{where}: watch")
+    return WatchSpec(paths=paths, ignore=ignore, interval=interval, debounce=debounce)
+
+
 def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) -> Service:
     where = f"service '{name}'"
     if isinstance(raw, str):  # shorthand:  worker: python3 worker.py
@@ -359,4 +403,5 @@ def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) 
         depends_on=[str(d) for d in depends_on],
         ready=_parse_ready(raw.get("ready"), where),
         profiles=[str(x) for x in profiles],
+        watch=_parse_watch(raw.get("watch"), where),
     )
