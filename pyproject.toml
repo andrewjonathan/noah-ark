@@ -47,6 +47,7 @@ packages = ["src/noah_ark"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]  # always test the working tree, never an installed copy
 
 [tool.ruff]
 line-length = 100
