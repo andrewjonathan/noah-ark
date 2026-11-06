@@ -1,4 +1,4 @@
-"""Command line interface:  noah up | down | ps | logs | init | validate."""
+"""Command line interface: noah up | down | restart | stop | start | ps | logs | init."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from noah_ark import __version__
+from noah_ark import __version__, control
 from noah_ark.config import ConfigError, Project, load_project
 from noah_ark.logs import ARK, Formatter, last_lines, parse_file_line, should_color
 from noah_ark.procstats import fmt_bytes, group_usage
@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=30.0, help="seconds to wait (default 30)")
     p.add_argument("--force", action="store_true", help="SIGKILL everything if it won't stop")
     p.set_defaults(func=cmd_down)
+
+    for name, nargs, text in (
+        ("restart", "*", "restart services in a running noah-ark (default: all)"),
+        ("stop", "+", "stop services in a running noah-ark (others keep running)"),
+        ("start", "+", "start services that were stopped, exited or crashed"),
+    ):
+        p = sub.add_parser(name, parents=[common], help=text)
+        p.add_argument("services", nargs=nargs, help="service names")
+        p.set_defaults(func=cmd_control, command=name)
 
     p = sub.add_parser("ps", parents=[common], help="show service status")
     p.set_defaults(func=cmd_ps)
@@ -168,6 +177,29 @@ def cmd_down(args: argparse.Namespace) -> int:
         return 0
     print("done.")
     return 0
+
+
+# ------------------------------------------------------- restart / stop / start
+def cmd_control(args: argparse.Namespace) -> int:
+    project = load_project(args.file)
+    unknown = [n for n in args.services if n not in project.services]
+    if unknown:
+        raise ConfigError(
+            f"unknown service(s): {', '.join(unknown)} (available: {', '.join(project.services)})"
+        )
+    store = StateStore(project.state_dir)
+    if store.running_pid() is None:
+        print("noah-ark is not running for this project (start it with `noah up -d`).",
+              file=sys.stderr)
+        return 1
+    path = Path(store.read_state().get("control") or control.socket_path(project))
+    try:
+        reply = control.send(path, args.command, list(args.services))
+    except (OSError, ValueError) as exc:
+        print(f"noah: cannot reach the running noah-ark at {path} ({exc})", file=sys.stderr)
+        return 1
+    print(reply.get("message", ""))
+    return 0 if reply.get("ok") else 1
 
 
 # --------------------------------------------------------------------------- ps

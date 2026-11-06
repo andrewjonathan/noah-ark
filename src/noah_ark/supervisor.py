@@ -10,6 +10,7 @@ from collections.abc import Iterable
 
 from noah_ark import __version__
 from noah_ark.config import Project
+from noah_ark.control import ControlServer, socket_path
 from noah_ark.logs import ARK, LogSink
 from noah_ark.process import ManagedProcess, Status
 from noah_ark.state import StateStore
@@ -41,6 +42,7 @@ class Supervisor:
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._started_at = time.time()
         self._forced = False
+        self.control: ControlServer | None = None
 
     def run(self) -> int:
         """Blocking entry point. Returns 0, or 1 if any service crashed."""
@@ -64,6 +66,12 @@ class Supervisor:
         self._idle = asyncio.Event()  # set when no service task is left running
         self._install_signal_handlers()
         self.store.write_pid(os.getpid())
+        control = ControlServer(self, socket_path(self.project))
+        try:
+            await control.start()
+            self.control = control
+        except OSError as exc:
+            self.sink.event(ARK, f"control socket unavailable ({exc}); restart/stop/start disabled")
         self.sink.event(
             ARK,
             f"noah-ark {__version__} · '{self.project.name}' · "
@@ -83,6 +91,9 @@ class Supervisor:
             shutdown.cancel()
             idle.cancel()
         finally:
+            if self.control is not None:
+                await self.control.close()
+                self.control = None
             self._save_state()
             self.store.clear_pid()
             self.sink.close()
@@ -182,6 +193,7 @@ class Supervisor:
                 "supervisor_pid": os.getpid(),
                 "started_at": self._started_at,
                 "updated_at": time.time(),
+                "control": str(self.control.path) if self.control else None,
                 "services": {n: p.snapshot() for n, p in self.procs.items()},
             }
         )
