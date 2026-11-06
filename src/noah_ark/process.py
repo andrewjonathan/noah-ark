@@ -62,6 +62,8 @@ class ManagedProcess:
         self._proc: asyncio.subprocess.Process | None = None
         self._pumps: list[asyncio.Task[None]] = []
         self._stop_requested = asyncio.Event()
+        self._restart_requested = False  # the next exit is ours: respawn right away
+        self._kick = asyncio.Event()  # cuts a backoff sleep short
 
     # ---------------------------------------------------------------- status
     def snapshot(self) -> dict[str, Any]:
@@ -192,14 +194,18 @@ class ManagedProcess:
                 await writer.wait_closed()
 
     # ------------------------------------------------------------- lifecycle
-    async def _wait_or_stop(self, aw: Awaitable[Any]) -> bool:
-        """Await `aw` unless a stop is requested first. True if `aw` finished."""
+    async def _wait_or_stop(self, aw: Awaitable[Any], *, kickable: bool = False) -> bool:
+        """Await `aw` unless a stop (or, if kickable, a kick) comes first.
+
+        True if `aw` finished."""
         work = asyncio.ensure_future(aw)
-        stop = asyncio.create_task(self._stop_requested.wait())
+        waiters = {work, asyncio.create_task(self._stop_requested.wait())}
+        if kickable:
+            waiters.add(asyncio.create_task(self._kick.wait()))
         try:
-            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for task in (work, stop):
+            for task in waiters:
                 if not task.done():
                     task.cancel()
         return work.done() and not work.cancelled()
@@ -223,6 +229,7 @@ class ManagedProcess:
 
         attempt = 0
         while not self._stop_requested.is_set():
+            self._kick.clear()
             try:
                 proc = await self._spawn()
             except OSError as exc:
@@ -243,6 +250,10 @@ class ManagedProcess:
 
             if self._stop_requested.is_set():
                 break
+            if self._restart_requested:  # we stopped it on purpose: no backoff, no count
+                self._restart_requested = False
+                attempt = 0
+                continue
             if time.monotonic() - started >= HEALTHY_UPTIME:
                 attempt = 0
             reason = describe_exit(code)
@@ -264,11 +275,35 @@ class ManagedProcess:
                 self.name, f"{reason}; restarting in {delay:.1f}s (restart #{self.restarts})"
             )
             self._set(Status.BACKOFF)
-            if not await self._wait_or_stop(asyncio.sleep(delay)):
-                break
+            if not await self._wait_or_stop(asyncio.sleep(delay), kickable=True):
+                if self._stop_requested.is_set():
+                    break
+                attempt = 0  # kicked by restart(): respawn now
 
         self._set(Status.STOPPED)
         self.sink.event(self.name, "stopped")
+
+    async def restart(self, reason: str = "requested") -> None:
+        """Stop the running process (whole group) and start it again immediately.
+
+        Does not count toward max_restarts. In backoff, skips the remaining delay."""
+        if self._stop_requested.is_set():
+            return
+        self.sink.event(self.name, f"restarting ({reason})")
+        proc = self._proc
+        if proc is not None and proc.returncode is None:
+            self._restart_requested = True
+            self._set(Status.STOPPING)
+            await self._terminate(proc)
+        else:
+            self._kick.set()
+
+    def reset(self) -> None:
+        """Make a finished service (stopped, exited, crashed) runnable again."""
+        self._stop_requested.clear()
+        self._restart_requested = False
+        self._kick.clear()
+        self.restarts = 0
 
     def request_stop(self) -> None:
         """No more restarts; anything waiting or backing off exits right away."""

@@ -15,6 +15,10 @@ from noah_ark.process import ManagedProcess, Status
 from noah_ark.state import StateStore
 
 
+class ControlError(Exception):
+    """A per-service control request that cannot be carried out."""
+
+
 class Supervisor:
     def __init__(
         self,
@@ -34,6 +38,7 @@ class Supervisor:
         self.timestamps = timestamps
         self.store = StateStore(project.state_dir)
         self.procs: dict[str, ManagedProcess] = {}
+        self.tasks: dict[str, asyncio.Task[None]] = {}
         self._started_at = time.time()
         self._forced = False
 
@@ -56,6 +61,7 @@ class Supervisor:
             for n in self.names
         }
         self._shutdown = asyncio.Event()
+        self._idle = asyncio.Event()  # set when no service task is left running
         self._install_signal_handlers()
         self.store.write_pid(os.getpid())
         self.sink.event(
@@ -64,31 +70,88 @@ class Supervisor:
             f"{len(self.names)} service(s) · Ctrl+C to stop",
         )
         try:
-            tasks = [asyncio.create_task(self._guarded(n)) for n in self.names]
-            everything = asyncio.gather(*tasks)
+            for name in self.names:
+                self._launch(name)
             shutdown = asyncio.create_task(self._shutdown.wait())
-            await asyncio.wait({everything, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+            idle = asyncio.create_task(self._idle.wait())
+            await asyncio.wait({idle, shutdown}, return_when=asyncio.FIRST_COMPLETED)
             if self._shutdown.is_set():
                 await self._stop_all()
             else:
                 self.sink.event(ARK, "all services have exited")
-            await everything
+            await asyncio.gather(*self.tasks.values())
             shutdown.cancel()
+            idle.cancel()
         finally:
             self._save_state()
             self.store.clear_pid()
             self.sink.close()
         return 1 if any(p.status is Status.CRASHED for p in self.procs.values()) else 0
 
-    async def _guarded(self, name: str) -> None:
+    def _launch(self, name: str, *, wait_for_deps: bool = True) -> None:
+        task = asyncio.create_task(self._guarded(name, wait_for_deps))
+        self.tasks[name] = task
+        self._idle.clear()
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, _task: asyncio.Task[None]) -> None:
+        if all(t.done() for t in self.tasks.values()):
+            self._idle.set()
+
+    async def _guarded(self, name: str, wait_for_deps: bool = True) -> None:
         proc = self.procs[name]
-        deps = [self.procs[d] for d in self.project.services[name].depends_on]
+        deps = (
+            [self.procs[d] for d in self.project.services[name].depends_on]
+            if wait_for_deps else []
+        )
         try:
             await proc.run(deps)
         except Exception as exc:  # a bug in noah-ark must not take down other services
             self.sink.event(name, f"internal error: {exc!r}")
             proc.status = Status.CRASHED
             proc.ready.set()
+
+    # ------------------------------------------------- per-service control
+    # Used by the control socket (`noah restart|stop|start`) and file watchers.
+    # Each returns a one-line message for the user; ControlError means "refused".
+
+    def _proc(self, name: str) -> ManagedProcess:
+        if name not in self.procs:
+            raise ControlError(
+                f"'{name}' is not part of this run (running: {', '.join(self.procs)})"
+            )
+        if self._shutdown.is_set():
+            raise ControlError("noah-ark is shutting down")
+        return self.procs[name]
+
+    def _running(self, name: str) -> bool:
+        task = self.tasks.get(name)
+        return task is not None and not task.done()
+
+    async def start(self, name: str) -> str:
+        proc = self._proc(name)
+        if self._running(name):
+            return f"{name}: already {proc.status.value}"
+        proc.reset()
+        self._launch(name, wait_for_deps=False)
+        return f"{name}: started"
+
+    async def stop(self, name: str) -> str:
+        proc = self._proc(name)
+        if not self._running(name):
+            return f"{name}: not running ({proc.status.value})"
+        await proc.stop()
+        await self.tasks[name]
+        return f"{name}: stopped"
+
+    async def restart(self, name: str, reason: str = "requested") -> str:
+        proc = self._proc(name)
+        if not self._running(name):
+            return await self.start(name)
+        if proc.status is Status.WAITING:
+            return f"{name}: still waiting for its dependencies, not restarted"
+        await proc.restart(reason)
+        return f"{name}: restarted"
 
     async def _stop_all(self) -> None:
         self.sink.event(ARK, "shutting down (press Ctrl+C again to force)")
