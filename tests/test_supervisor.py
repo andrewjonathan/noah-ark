@@ -124,3 +124,53 @@ def test_no_restarts_during_shutdown(tmp_path):
         timer.cancel()
         killer.cancel()
     assert "restarting" not in (tmp_path / ".ark/logs/base.log").read_text()
+
+
+def free_port():
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_http_ready_waits_for_healthy_status(tmp_path):
+    # The server listens immediately but answers 503 three times before 200: a plain
+    # port check would start 'after' too early; the HTTP check must wait for the 200.
+    port = free_port()
+    (tmp_path / "server.py").write_text(
+        "import http.server\n"
+        "hits = 0\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        global hits\n"
+        "        hits += 1\n"
+        "        code = 200 if hits > 3 else 503\n"
+        "        print('health', code, flush=True)\n"
+        "        self.send_response(code)\n"
+        "        self.end_headers()\n"
+        "    def log_message(self, *a):\n"
+        "        pass\n"
+        f"http.server.HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n"
+    )
+    project = make_project(tmp_path, f"""
+  api: {{cmd: ["{PY}", "server.py"], ready: {{port: {port}, http: /health, timeout: 15}}}}
+  after: {{cmd: ["{PY}", "-c", "print('go')"], restart: "no", depends_on: [api]}}
+""")
+    sup = Supervisor(project, console=False)
+
+    def stop_when_done():
+        log = tmp_path / ".ark/logs/after.log"
+        for _ in range(150):
+            if log.exists() and " out go" in log.read_text():
+                break
+            threading.Event().wait(0.1)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop_when_done, daemon=True).start()
+    sup.run()
+    api_log = (tmp_path / ".ark/logs/api.log").read_text()
+    assert "ready (GET /health → 200)" in api_log
+    assert api_log.count("health 503") == 3
+    ark_log = (tmp_path / ".ark/logs/ark.log").read_text()
+    assert ark_log.index("[api] ready") < ark_log.index("[after] started")

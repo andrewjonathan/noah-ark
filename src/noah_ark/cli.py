@@ -1,19 +1,21 @@
-"""Command line interface:  noah up | down | ps | logs | init | validate."""
+"""Command line interface: noah up | down | restart | stop | start | ps | logs | init."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from noah_ark import __version__
+from noah_ark import __version__, control
 from noah_ark.config import ConfigError, Project, load_project
 from noah_ark.logs import ARK, Formatter, last_lines, parse_file_line, should_color
+from noah_ark.procstats import fmt_bytes, group_usage
 from noah_ark.state import StateStore, pid_alive
 
 
@@ -48,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("up", parents=[common], help="start services and stream labelled logs")
     p.add_argument("services", nargs="*", help="only these services (plus their dependencies)")
     p.add_argument("-d", "--detach", action="store_true", help="run in the background")
+    p.add_argument("-p", "--profile", action="append", default=[], metavar="NAME",
+                   help="also start services in this profile (repeatable)")
     p.add_argument("-t", "--timestamps", action="store_true", help="prefix lines with a clock")
     p.add_argument("--no-color", action="store_true", help="disable colours")
     p.add_argument("--no-console", action="store_true", help=argparse.SUPPRESS)
@@ -58,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="SIGKILL everything if it won't stop")
     p.set_defaults(func=cmd_down)
 
+    for name, nargs, text in (
+        ("restart", "*", "restart services in a running noah-ark (default: all)"),
+        ("stop", "+", "stop services in a running noah-ark (others keep running)"),
+        ("start", "+", "start services that were stopped, exited or crashed"),
+    ):
+        p = sub.add_parser(name, parents=[common], help=text)
+        p.add_argument("services", nargs=nargs, help="service names")
+        p.set_defaults(func=cmd_control, command=name)
+
     p = sub.add_parser("ps", parents=[common], help="show service status")
     p.set_defaults(func=cmd_ps)
 
@@ -66,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("services", nargs="*", help=f"only these services ('{ARK}' = noah-ark itself)")
     p.add_argument("-f", "--follow", action="store_true", help="keep streaming new lines")
     p.add_argument("-n", "--lines", type=int, default=100, help="history lines (default 100)")
+    p.add_argument("-g", "--grep", metavar="REGEX", help="only lines matching this pattern")
+    p.add_argument("-i", "--ignore-case", action="store_true", help="case-insensitive --grep")
     p.add_argument("-t", "--timestamps", action="store_true")
     p.add_argument("--no-color", action="store_true")
     p.set_defaults(func=cmd_logs)
@@ -85,7 +100,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     from noah_ark.supervisor import Supervisor
 
     project = load_project(args.file)
-    names = project.select(args.services)
+    names = project.select(args.services, args.profile)
     store = StateStore(project.state_dir)
     running = store.running_pid()
     if running:
@@ -96,22 +111,25 @@ def cmd_up(args: argparse.Namespace) -> int:
         )
         return 1
     if args.detach:
-        return _start_detached(project, args.services, len(names))
+        return _start_detached(project, args.services, args.profile, len(names))
     return Supervisor(
         project,
         args.services,
+        profiles=args.profile,
         console=not args.no_console,
         color=False if args.no_color else None,
         timestamps=args.timestamps,
     ).run()
 
 
-def _start_detached(project: Project, services: list[str], count: int) -> int:
+def _start_detached(
+    project: Project, services: list[str], profiles: list[str], count: int
+) -> int:
     store = StateStore(project.state_dir)
     store.ensure()
     out_path = project.state_dir / "daemon.log"
     argv = [sys.executable, "-m", "noah_ark", "up", "-f", str(project.config_path),
-            "--no-console", *services]
+            "--no-console", *(f"--profile={p}" for p in profiles), *services]
     with open(out_path, "ab") as out:
         proc = subprocess.Popen(
             argv, cwd=project.root, stdin=subprocess.DEVNULL, stdout=out,
@@ -161,6 +179,29 @@ def cmd_down(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------- restart / stop / start
+def cmd_control(args: argparse.Namespace) -> int:
+    project = load_project(args.file)
+    unknown = [n for n in args.services if n not in project.services]
+    if unknown:
+        raise ConfigError(
+            f"unknown service(s): {', '.join(unknown)} (available: {', '.join(project.services)})"
+        )
+    store = StateStore(project.state_dir)
+    if store.running_pid() is None:
+        print("noah-ark is not running for this project (start it with `noah up -d`).",
+              file=sys.stderr)
+        return 1
+    path = Path(store.read_state().get("control") or control.socket_path(project))
+    try:
+        reply = control.send(path, args.command, list(args.services))
+    except (OSError, ValueError) as exc:
+        print(f"noah: cannot reach the running noah-ark at {path} ({exc})", file=sys.stderr)
+        return 1
+    print(reply.get("message", ""))
+    return 0 if reply.get("ok") else 1
+
+
 # --------------------------------------------------------------------------- ps
 def _fmt_duration(seconds: float) -> str:
     seconds = int(max(seconds, 0))
@@ -181,18 +222,22 @@ def cmd_ps(args: argparse.Namespace) -> int:
     store = StateStore(project.state_dir)
     sup_pid = store.running_pid()
     services = store.read_state().get("services", {}) if sup_pid else {}
-    header = ("NAME", "STATUS", "PID", "RESTARTS", "UPTIME")
+    usage = group_usage(int(s["pid"]) for s in services.values() if s.get("pid"))
+    header = ("NAME", "STATUS", "PID", "CPU", "MEM", "RESTARTS", "UPTIME")
     rows = []
     for name in project.services:
         s = services.get(name)
         if not s:
-            rows.append((name, "stopped", "-", "-", "-"))
+            rows.append((name, "stopped", "-", "-", "-", "-", "-"))
             continue
         running = s.get("status") == "running" and s.get("started_at")
+        cpu_mem = usage.get(int(s["pid"])) if s.get("pid") else None
         rows.append((
             name,
             s.get("status", "?"),
             str(s["pid"]) if s.get("pid") else "-",
+            f"{cpu_mem[0]:.1f}%" if cpu_mem else "-",
+            fmt_bytes(cpu_mem[1]) if cpu_mem else "-",
             str(s.get("restarts", 0)),
             _fmt_duration(time.time() - s["started_at"]) if running else "-",
         ))
@@ -212,6 +257,12 @@ def cmd_logs(args: argparse.Namespace) -> int:
         raise ConfigError(f"unknown service(s): {', '.join(unknown)}")
     fmt = Formatter(names, should_color(sys.stdout, False if args.no_color else None),
                     args.timestamps)
+    try:
+        pattern = (
+            re.compile(args.grep, re.IGNORECASE if args.ignore_case else 0) if args.grep else None
+        )
+    except re.error as exc:
+        raise ConfigError(f"invalid --grep pattern: {exc}") from exc
     paths = {n: project.log_dir / f"{n}.log" for n in names}
     if not args.follow and not any(p.exists() for p in paths.values()):
         print("no logs yet; run `noah up` first.")
@@ -226,7 +277,8 @@ def cmd_logs(args: argparse.Namespace) -> int:
         inodes[name] = path.stat().st_ino if path.exists() else -1
         for line in lines:
             ts, stream, text = parse_file_line(line)
-            entries.append((ts, name, stream, text))
+            if pattern is None or pattern.search(text):
+                entries.append((ts, name, stream, text))
     entries.sort(key=lambda e: e[0])
     for ts, name, stream, text in entries[-args.lines:] if args.lines > 0 else []:
         print(fmt.format(name, stream, text, ts))
@@ -254,6 +306,8 @@ def cmd_logs(args: argparse.Namespace) -> int:
                 *complete, partial[name] = (partial[name] + chunk).split(b"\n")
                 for raw in complete:
                     ts, stream, text = parse_file_line(raw.decode("utf-8", "replace"))
+                    if pattern is not None and not pattern.search(text):
+                        continue
                     sys.stdout.write(fmt.format(name, stream, text, ts) + "\n")
                     wrote = True
             if wrote:
@@ -333,5 +387,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         for name in level:
             svc = project.services[name]
             extra = f"  (after {', '.join(svc.depends_on)})" if svc.depends_on else ""
+            if svc.profiles:
+                extra += f"  [profiles: {', '.join(svc.profiles)}]"
             print(f"  {i}. {name:<16} {' '.join(svc.cmd)}{extra}")
     return 0

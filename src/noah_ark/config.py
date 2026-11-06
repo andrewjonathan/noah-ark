@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -19,8 +20,9 @@ RESTART_POLICIES = ("no", "on-failure", "always")
 TOP_LEVEL_KEYS = {"version", "name", "env", "services"}
 SERVICE_KEYS = {
     "cmd", "cwd", "env", "env_file", "venv", "shell",
-    "restart", "max_restarts", "stop_timeout", "depends_on", "ready",
+    "restart", "max_restarts", "stop_timeout", "depends_on", "ready", "profiles", "watch",
 }
+WATCH_KEYS = {"paths", "ignore", "interval", "debounce"}
 
 
 class ConfigError(Exception):
@@ -29,11 +31,30 @@ class ConfigError(Exception):
 
 @dataclass
 class ReadyCheck:
-    """A service is 'ready' once this TCP port accepts connections."""
+    """A service is 'ready' once this TCP port accepts connections.
+
+    With `http` set, it must also answer `GET <http>` with `status`
+    (or any 2xx/3xx when `status` is not set).
+    """
 
     port: int
     host: str = "127.0.0.1"
     timeout: float = 30.0
+    http: str | None = None
+    status: int | None = None
+
+    def accepts(self, code: int) -> bool:
+        return code == self.status if self.status is not None else 200 <= code < 400
+
+
+@dataclass
+class WatchSpec:
+    """Restart the service when files matching `paths` (under its cwd) change."""
+
+    paths: list[str]
+    ignore: list[str] = field(default_factory=list)  # added to watch.DEFAULT_IGNORE
+    interval: float = 1.0
+    debounce: float = 0.3
 
 
 @dataclass
@@ -47,6 +68,8 @@ class Service:
     stop_timeout: float = 10.0
     depends_on: list[str] = field(default_factory=list)
     ready: ReadyCheck | None = None
+    profiles: list[str] = field(default_factory=list)
+    watch: WatchSpec | None = None
 
 
 @dataclass
@@ -64,11 +87,25 @@ class Project:
     def log_dir(self) -> Path:
         return self.state_dir / "logs"
 
-    def select(self, names: Iterable[str] | None = None) -> list[str]:
-        """The requested services plus everything they (transitively) depend on."""
+    def select(
+        self, names: Iterable[str] | None = None, profiles: Iterable[str] = ()
+    ) -> list[str]:
+        """The requested services plus everything they (transitively) depend on.
+
+        With no names: every service without `profiles`, plus those in an active profile.
+        Explicitly named services are always selected, whatever their profiles.
+        """
         wanted = list(names or [])
+        active = set(profiles)
+        unknown_profiles = sorted(active - {p for s in self.services.values() for p in s.profiles})
+        if unknown_profiles:
+            raise ConfigError(f"unknown profile(s): {', '.join(unknown_profiles)}")
         if not wanted:
-            return list(self.services)
+            wanted = [
+                n for n, s in self.services.items() if not s.profiles or active & set(s.profiles)
+            ]
+            if not wanted:
+                raise ConfigError("no services selected (every service is in a profile)")
         unknown = [n for n in wanted if n not in self.services]
         if unknown:
             raise ConfigError(
@@ -219,19 +256,85 @@ def _number(raw: dict[str, Any], key: str, default: float, kind: type, where: st
     return kind(value)
 
 
+READY_HELP = "a port number, an http://host:port/path URL, or {port, host, http, status, timeout}"
+
+
 def _parse_ready(raw: Any, where: str) -> ReadyCheck | None:
     if raw is None:
         return None
     if isinstance(raw, int) and not isinstance(raw, bool):
         raw = {"port": raw}
+    elif isinstance(raw, str):
+        raw = _parse_ready_url(raw, where)
     if not isinstance(raw, dict):
-        raise ConfigError(f"{where}: `ready` must be a port number or {{port, host, timeout}}")
-    _check_keys(raw, {"port", "host", "timeout"}, f"{where}: ready")
+        raise ConfigError(f"{where}: `ready` must be {READY_HELP}")
+    _check_keys(raw, {"port", "host", "timeout", "http", "status"}, f"{where}: ready")
     port = raw.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ConfigError(f"{where}: ready.port must be a number between 1 and 65535")
     timeout = _number(raw, "timeout", 30.0, float, f"{where}: ready")
-    return ReadyCheck(port=port, host=str(raw.get("host", "127.0.0.1")), timeout=timeout)
+    http = raw.get("http")
+    if http is not None and (not isinstance(http, str) or not http.startswith("/")):
+        raise ConfigError(f"{where}: ready.http must be a path starting with '/', e.g. /health")
+    status = raw.get("status")
+    if status is not None:
+        if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+            raise ConfigError(f"{where}: ready.status must be an HTTP status code (100-599)")
+        if http is None:
+            raise ConfigError(f"{where}: ready.status needs ready.http")
+    return ReadyCheck(
+        port=port,
+        host=str(raw.get("host", "127.0.0.1")),
+        timeout=timeout,
+        http=http,
+        status=status,
+    )
+
+
+def _parse_ready_url(raw: str, where: str) -> dict[str, Any]:
+    url = urlsplit(raw.strip())
+    try:
+        port = url.port
+    except ValueError:
+        port = None
+    if url.scheme != "http" or not url.hostname or port is None:
+        raise ConfigError(
+            f"{where}: ready URL must look like http://127.0.0.1:8001/health (got {raw!r})"
+        )
+    path = (url.path or "/") + (f"?{url.query}" if url.query else "")
+    return {"port": port, "host": url.hostname, "http": path}
+
+
+def _string_list(raw: Any, what: str) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x.strip() for x in raw):
+        raise ConfigError(f"{what} must be a pattern or a list of patterns")
+    return list(raw)
+
+
+def _parse_watch(raw: Any, where: str) -> WatchSpec | None:
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, (str, list)):
+        raw = {"paths": raw}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: `watch` must be a pattern, a list, or {{paths, ignore, ...}}")
+    _check_keys(raw, WATCH_KEYS, f"{where}: watch")
+    paths = _string_list(raw.get("paths"), f"{where}: watch.paths")
+    if not paths:
+        raise ConfigError(f"{where}: watch.paths must not be empty")
+    for pattern in paths:
+        if pattern.startswith("/") or ".." in pattern.split("/"):
+            raise ConfigError(
+                f"{where}: watch pattern {pattern!r} must stay inside the service's cwd"
+            )
+    ignore = _string_list(raw["ignore"], f"{where}: watch.ignore") if "ignore" in raw else []
+    interval = _number(raw, "interval", 1.0, float, f"{where}: watch")
+    if interval < 0.1:
+        raise ConfigError(f"{where}: watch.interval must be at least 0.1 seconds")
+    debounce = _number(raw, "debounce", 0.3, float, f"{where}: watch")
+    return WatchSpec(paths=paths, ignore=ignore, interval=interval, debounce=debounce)
 
 
 def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) -> Service:
@@ -283,6 +386,12 @@ def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) 
     if not isinstance(depends_on, list):
         raise ConfigError(f"{where}: depends_on must be a list of service names")
 
+    profiles = raw.get("profiles") or []
+    if isinstance(profiles, str):
+        profiles = [profiles]
+    if not isinstance(profiles, list) or not all(NAME_RE.match(str(x)) for x in profiles):
+        raise ConfigError(f"{where}: profiles must be a list of names")
+
     return Service(
         name=name,
         cmd=cmd,
@@ -293,4 +402,6 @@ def _build_service(name: str, raw: Any, root: Path, global_env: dict[str, str]) 
         stop_timeout=_number(raw, "stop_timeout", 10.0, float, where),
         depends_on=[str(d) for d in depends_on],
         ready=_parse_ready(raw.get("ready"), where),
+        profiles=[str(x) for x in profiles],
+        watch=_parse_watch(raw.get("watch"), where),
     )

@@ -103,14 +103,36 @@ curl localhost:8002/orders/42      # api-b calls api-a; watch both logs
 |---|---|
 | `noah up [svc...]` | Start services (and their dependencies) in the foreground with live logs |
 | `noah up -d` | Start in the background |
+| `noah up --profile dev` | Also start services in the `dev` profile (repeatable) |
+| `noah restart [svc...]` | Restart services in a running noah-ark, all of them by default |
+| `noah stop svc...` | Stop some services; the rest keep running |
+| `noah start svc...` | Start services that were stopped, finished or gave up |
 | `noah logs [-f] [-n 100] [svc...]` | Show history merged by timestamp; `-f` follows live |
-| `noah ps` | Status, pid, restarts and uptime of every service |
+| `noah logs --grep ERROR [-i]` | Only lines matching a regex (works with `-f`) |
+| `noah ps` | Status, pid, CPU, memory, restarts and uptime of every service |
 | `noah down` | Gracefully stop a background run (`--force` to SIGKILL) |
 | `noah init` | Generate `ark.yaml` from `./services/*` |
 | `noah validate` | Check `ark.yaml` and print the start order |
 
 Useful flags: `-t/--timestamps`, `--no-color`, `-f/--file path/to/ark.yaml`.
 `NO_COLOR=1` and `FORCE_COLOR=1` are respected.
+
+`restart`, `stop` and `start` work for both foreground and `-d` runs. Use them from
+another terminal:
+
+```text
+$ noah ps
+NAME    STATUS   PID    CPU   MEM  RESTARTS  UPTIME
+api-a   running  41210  0.4%  47M  0         12m3s
+api-b   running  41215  0.3%  47M  0         12m1s
+worker  running  41216  0.0%  12M  0         12m1s
+
+$ noah restart api-b
+api-b: restarted
+```
+
+CPU and memory add up the service's whole process tree (reloaders, workers, children).
+A requested restart skips the crash backoff and does not count toward `max_restarts`.
 
 ## ark.yaml reference
 
@@ -128,7 +150,7 @@ services:
     venv: .venv                               # optional: use this service's virtualenv
     env: { DATABASE_URL: "${DATABASE_URL}" }
     env_file: .env                            # optional, relative to ark.yaml
-    ready: 8001                               # or {port: 8001, host: 127.0.0.1, timeout: 30}
+    ready: 8001                               # wait for this port; see "Readiness" below
     restart: on-failure                       # no | on-failure (default) | always
     max_restarts: 10
     stop_timeout: 10                          # seconds between SIGTERM and SIGKILL
@@ -138,9 +160,66 @@ services:
     cwd: services/api_b
     cmd: uvicorn main:app --port 8002
     depends_on: [api-a]                       # starts after api-a is ready
+    ready: http://127.0.0.1:8002/health       # wait for GET /health to answer 2xx/3xx
 
-  worker: python3 worker.py                   # shorthand: just a command
+  worker:
+    cmd: python3 worker.py
+    watch: "**/*.py"                          # restart when these files change
+
+  admin:
+    cmd: python3 admin.py
+    profiles: [tools]                         # only with `noah up --profile tools`
+
+  migrate: python3 migrate.py                 # shorthand: just a command
 ```
+
+### Readiness
+
+A dependent service starts once its dependencies are ready.
+
+```yaml
+ready: 8001                                   # the TCP port accepts connections
+ready: http://127.0.0.1:8001/health           # GET returns 2xx or 3xx
+ready:
+  port: 8001
+  host: 127.0.0.1                             # default
+  http: /health                               # optional: also require an HTTP answer
+  status: 200                                 # optional: require exactly this code
+  timeout: 30                                 # seconds; after that, continue anyway
+```
+
+An open port does not always mean the app can serve requests (migrations, warm-up,
+loading a model). Use `http` when that matters.
+
+### File watching
+
+```yaml
+watch: "*.py"                                 # one pattern
+watch: ["app/**/*.py", "templates/**"]        # several
+watch:
+  paths: ["**/*.py"]
+  ignore: [build, "*.generated.py"]           # added to the defaults below
+  interval: 1.0                               # seconds between scans
+  debounce: 0.3                               # wait for a save to settle
+```
+
+Patterns are matched under the service's `cwd`. A pattern without `/` matches a file
+name anywhere (`*.py`); one with `/` matches the relative path (`app/**/*.py`).
+`.git`, `.venv`, `venv`, `node_modules`, `__pycache__`, `.ark` and editor swap files
+are always ignored. Watching uses polling, so it needs no extra dependency and works
+the same on every OS.
+
+When a file changes, a running service restarts. A service that crashed and gave up,
+or a one-shot task that finished, starts again, which makes `watch` handy for build
+steps. A service you stopped with `noah stop` stays stopped until `noah start`.
+
+`watch` works for any command. For uvicorn, use either `watch` or `--reload`, not both.
+
+### Profiles
+
+Services with `profiles` start only when one of their profiles is active
+(`noah up --profile tools`), when named on the command line (`noah up admin`), or
+when a selected service depends on them. Services without `profiles` always start.
 
 Unknown keys are rejected with a helpful message, so typos fail loudly instead of
 being silently ignored.
@@ -150,6 +229,7 @@ being silently ignored.
 ```mermaid
 flowchart LR
     CLI["noah CLI<br/>up · down · ps · logs"] --> SUP
+    CTL["noah restart · stop · start"] -- ".ark/noah.sock" --> SUP
     subgraph SUP["Supervisor (one asyncio event loop)"]
         direction TB
         MP1["ManagedProcess api-a"]
@@ -168,8 +248,9 @@ flowchart LR
 
 Design decisions:
 
-- **One event loop, no threads, no daemon.** All services are read through non-blocking
-  pipes in a single asyncio loop, so overhead stays roughly constant as you add services.
+- **One event loop, no daemon.** All services are read through non-blocking pipes in a
+  single asyncio loop, so overhead stays roughly constant as you add services. The only
+  thread work is the `watch` directory scan, so a large tree never stalls log output.
 - **Each service gets its own process group** (`start_new_session`). Ctrl+C reaches only
   noah-ark, which stops services in reverse dependency order; stopping a service signals
   its whole tree (uvicorn reloaders, gunicorn workers, shell children), and leftover
@@ -179,6 +260,8 @@ Design decisions:
 - **Exponential backoff** on crashes (0.5s → 30s cap), reset after 30s of healthy uptime.
 - **Files are the IPC.** A background run writes per-service logs and an atomically
   replaced `state.json`; `noah logs` and `noah ps` just read them. Nothing to keep alive.
+  The one exception is `restart`/`stop`/`start`, which send a JSON line to the running
+  supervisor over a Unix socket (`.ark/noah.sock`, mode 0600).
 - **`PYTHONUNBUFFERED=1` is set by default**, so Python output appears instantly instead
   of in 4 KB chunks when piped.
 
@@ -191,8 +274,11 @@ stderr as an error.
 src/noah_ark/
 ├── cli.py         # argparse commands
 ├── config.py      # ark.yaml loading, validation, dependency ordering
-├── supervisor.py  # runs a project, signals, ordered shutdown
+├── supervisor.py  # runs a project, signals, ordered shutdown, per-service control
 ├── process.py     # one supervised service: spawn, pump logs, ready check, restart
+├── control.py     # control socket server + client for restart/stop/start
+├── watch.py       # polling file watcher, glob patterns
+├── procstats.py   # CPU / memory per process group for `noah ps`
 ├── logs.py        # formatter, console sink, rotating files, tail
 └── state.py       # pid file + state.json
 ```
@@ -208,12 +294,12 @@ ruff check . && pytest -q
 
 ## Roadmap
 
-- [ ] `noah restart <svc>` and `noah stop <svc>` via a control socket (`.ark/noah.sock`)
-- [ ] File watching (`watch: ["**/*.py"]`) for any service, not only uvicorn `--reload`
-- [ ] HTTP readiness checks (`ready: {http: /health}`)
-- [ ] Per-service CPU / memory in `noah ps`
-- [ ] Log filtering: `noah logs --grep ERROR`
-- [ ] `noah up --profile dev` (service groups)
+- [x] `noah restart|stop|start <svc>` via a control socket (`.ark/noah.sock`)
+- [x] File watching (`watch: ["**/*.py"]`) for any service, not only uvicorn `--reload`
+- [x] HTTP readiness checks (`ready: {http: /health}`)
+- [x] Per-service CPU / memory in `noah ps`
+- [x] Log filtering: `noah logs --grep ERROR`
+- [x] `noah up --profile dev` (service groups)
 - [ ] Windows support (Job Objects instead of process groups)
 - [x] Distribution: PyPI (`pipx install noah-ark`)
 - [ ] Distribution: `.deb` packages on GitHub Releases built with nfpm, then a
