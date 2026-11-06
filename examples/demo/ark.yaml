@@ -11,7 +11,7 @@ services:
   api-a:
     cwd: services/api_a
     cmd: uvicorn main:app --host 127.0.0.1 --port 8001
-    ready: 8001            # api-b waits until this port is open
+    ready: http://127.0.0.1:8001/health   # api-b waits until GET /health answers
 
   api-b:
     cwd: services/api_b
@@ -26,3 +26,4 @@ services:
     cmd: python3 worker.py
     restart: always
     depends_on: [api-a]
+    watch: "*.py"          # edit worker.py and it restarts by itself
